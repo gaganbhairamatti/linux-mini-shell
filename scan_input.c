@@ -47,12 +47,12 @@ void signal_handler(int signum)
             kill(pid, SIGINT);
         }
     }
-
     else if (signum == SIGTSTP)
     {
         if (pid == 0)
         {
             printf("\n%s ", prompt1);
+            fflush(stdout);
         }
         else
         {
@@ -62,18 +62,13 @@ void signal_handler(int signum)
             pid = 0;
         }
     }
-
     else if (signum == SIGCHLD)
     {
         pid_t child;
+        // Reaping children silently to avoid non-async-safe printf calls in handler
         while ((child = waitpid(-1, &status, WNOHANG)) > 0)
         {
-            if (WIFEXITED(status))
-            {
-                printf("\n[BG] %d exited (%d)\n", child, WEXITSTATUS(status));
-                printf("%s ", prompt1);
-                fflush(stdout);
-            }
+            // Child reaped
         }
     }
 }
@@ -89,12 +84,14 @@ void execute_internal_commands(char *input)
     }
     else if (strcmp(input, "pwd") == 0)
     {
-        getcwd(cwd, sizeof(cwd));
-        printf("%s\n", cwd);
+        if (getcwd(cwd, sizeof(cwd)) != NULL)
+            printf("%s\n", cwd);
     }
     else if (strncmp(input, "cd", 2) == 0)
     {
-        char *path = strtok(input + 2, " \t");
+        char *saveptr;
+        strtok_r(input, " \t", &saveptr); // skip "cd"
+        char *path = strtok_r(NULL, " \t", &saveptr);
 
         if (path == NULL)
             chdir(getenv("HOME"));
@@ -117,7 +114,6 @@ void execute_internal_commands(char *input)
     {
         jobs_t *temp = head;
         int id = 1;
-
         while (temp)
         {
             printf("[%d] %d %s\n", id++, temp->pid, temp->command);
@@ -131,19 +127,14 @@ void execute_internal_commands(char *input)
             printf("fg: no jobs\n");
             return;
         }
-
         jobs_t *job = head;
         head = head->link;
-
         pid = job->pid;
         kill(pid, SIGCONT);
-
         int status;
         waitpid(pid, &status, WUNTRACED);
-
         if (WIFEXITED(status))
             last_status = WEXITSTATUS(status);
-
         pid = 0;
         free(job);
     }
@@ -154,53 +145,60 @@ void execute_internal_commands(char *input)
             printf("bg: no jobs\n");
             return;
         }
-
         jobs_t *job = head;
         head = head->link;
-
         kill(job->pid, SIGCONT);
         printf("[BG] %d resumed\n", job->pid);
-
         free(job);
     }
 }
 
-/* ---------------- PIPE (FIXED PARALLEL) ---------------- */
+/* ---------------- PIPE (FIXED RE-ENTRANCY & FD LEAKS) ---------------- */
 void execute_pipeline(char *input)
 {
     char *cmds[20];
     int n = 0;
+    char *saveptr1, *saveptr2;
 
-    cmds[n++] = strtok(input, "|");
-    while ((cmds[n++] = strtok(NULL, "|")) != NULL);
-    n--;
+    // Use strtok_r to avoid corrupting internal pointers
+    cmds[n++] = strtok_r(input, "|", &saveptr1);
+    while (n < 20 && (cmds[n] = strtok_r(NULL, "|", &saveptr1)) != NULL) {
+        n++;
+    }
 
     int pipe_fd[2];
     int prev_fd = 0;
-
     pid_t pids[20];
 
     for (int i = 0; i < n; i++)
     {
-        pipe(pipe_fd);
+        if (i < n - 1) {
+            if (pipe(pipe_fd) == -1) {
+                perror("pipe");
+                return;
+            }
+        }
 
         if ((pids[i] = fork()) == 0)
         {
-            dup2(prev_fd, 0);
+            if (prev_fd != 0) {
+                dup2(prev_fd, 0);
+                close(prev_fd);
+            }
 
-            if (i != n - 1)
+            if (i < n - 1) {
                 dup2(pipe_fd[1], 1);
-
-            close(pipe_fd[0]);
+                close(pipe_fd[0]);
+                close(pipe_fd[1]);
+            }
 
             char *argv[20];
             int j = 0;
-
-            char *token = strtok(cmds[i], " ");
-            while (token)
+            char *token = strtok_r(cmds[i], " \t", &saveptr2);
+            while (token && j < 19)
             {
                 argv[j++] = token;
-                token = strtok(NULL, " ");
+                token = strtok_r(NULL, " \t", &saveptr2);
             }
             argv[j] = NULL;
 
@@ -209,8 +207,14 @@ void execute_pipeline(char *input)
             exit(1);
         }
 
-        close(pipe_fd[1]);
-        prev_fd = pipe_fd[0];
+        // Parent: Close FDs that are no longer needed
+        if (prev_fd != 0)
+            close(prev_fd);
+        
+        if (i < n - 1) {
+            close(pipe_fd[1]);
+            prev_fd = pipe_fd[0]; // Save read end for next command
+        }
     }
 
     for (int i = 0; i < n; i++)
@@ -223,17 +227,17 @@ void execute_external_commands(char *input)
     if (strchr(input, '|'))
     {
         execute_pipeline(input);
-        return;
+        exit(0); // Exit child after pipeline finishes
     }
 
     char *argv[20];
     int i = 0;
-
-    char *token = strtok(input, " ");
-    while (token)
+    char *saveptr;
+    char *token = strtok_r(input, " \t", &saveptr);
+    while (token && i < 19)
     {
         argv[i++] = token;
-        token = strtok(NULL, " ");
+        token = strtok_r(NULL, " \t", &saveptr);
     }
     argv[i] = NULL;
 
@@ -254,9 +258,10 @@ void scan_input(char *prompt, char *input)
     while (1)
     {
         printf("%s ", prompt);
+        fflush(stdout);
 
         if (!fgets(input, 1024, stdin))
-            continue;
+            break;
 
         input[strcspn(input, "\n")] = '\0';
         trim_string(input);
@@ -266,7 +271,6 @@ void scan_input(char *prompt, char *input)
 
         strcpy(last_input, input);
 
-        /* -------- PS1 STRICT -------- */
         if (strncmp(input, "PS1=", 4) == 0 && strchr(input, ' ') == NULL)
         {
             strcpy(prompt, input + 4);
@@ -274,9 +278,11 @@ void scan_input(char *prompt, char *input)
         }
 
         char temp[1024];
-        strcpy(temp, input);
+        strncpy(temp, input, sizeof(temp)-1);
+        temp[sizeof(temp)-1] = '\0';
 
-        char *cmd = strtok(temp, " ");
+        char *saveptr;
+        char *cmd = strtok_r(temp, " ", &saveptr);
         int type = check_command_type(cmd, external_commands);
 
         if (type == BUILTIN)
@@ -286,9 +292,8 @@ void scan_input(char *prompt, char *input)
         else if (type == EXTERNAL)
         {
             int background = 0;
-
             int len = strlen(input);
-            if (input[len - 1] == '&')
+            if (len > 0 && input[len - 1] == '&')
             {
                 background = 1;
                 input[len - 1] = '\0';
@@ -303,10 +308,8 @@ void scan_input(char *prompt, char *input)
                 if (!background)
                 {
                     waitpid(pid, &status, WUNTRACED);
-
                     if (WIFEXITED(status))
                         last_status = WEXITSTATUS(status);
-
                     pid = 0;
                 }
                 else
@@ -314,16 +317,19 @@ void scan_input(char *prompt, char *input)
                     printf("[BG] %d started\n", pid);
                 }
             }
-            else
+            else if (pid == 0)
             {
                 signal(SIGINT, SIG_DFL);
                 signal(SIGTSTP, SIG_DFL);
                 execute_external_commands(input);
             }
+            else {
+                perror("fork");
+            }
         }
         else
         {
-            printf("command not found\n");
+            printf("%s: command not found\n", cmd);
         }
     }
 }
